@@ -1,0 +1,42 @@
+name: Track Fringe Reviews
+
+# Runs automatically twice a day, and lets you trigger it manually
+# from the Actions tab any time you want an immediate check.
+on:
+  schedule:
+    - cron: "0 8 * * *"   # 08:00 UTC every day
+    - cron: "0 18 * * *"  # 18:00 UTC every day
+  workflow_dispatch: {}
+
+# Needed so the workflow can commit the updated data files back to the repo
+permissions:
+  contents: write
+
+jobs:
+  check-reviews:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run tracker
+        env:
+          GOOGLE_SEARCH_API_KEY: ${{ secrets.GOOGLE_SEARCH_API_KEY }}
+          GOOGLE_SEARCH_CX: ${{ secrets.GOOGLE_SEARCH_CX }}
+        run: python fringe_tracker.py
+
+      - name: Commit updated data
+        run: |
+          git config user.name "fringe-tracker-bot"
+          git config user.email "actions@github.com"
+          git add data/reviews.json data/status.json
+          git diff --quiet --cached || git commit -m "Update review data [automated]"
+          git push
