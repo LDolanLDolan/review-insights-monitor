@@ -4,8 +4,7 @@ name: Track Fringe Reviews
 # from the Actions tab any time you want an immediate check.
 on:
   schedule:
-    - cron: "0 8 * * *"   # 08:00 UTC every day
-    - cron: "0 18 * * *"  # 18:00 UTC every day
+    - cron: "0 9 * * *"   # 09:00 UTC every day — one run, one day's worth of quota
   workflow_dispatch: {}
 
 # Needed so the workflow can commit the updated data files back to the repo
@@ -31,6 +30,8 @@ jobs:
         env:
           GOOGLE_SEARCH_API_KEY: ${{ secrets.GOOGLE_SEARCH_API_KEY }}
           GOOGLE_SEARCH_CX: ${{ secrets.GOOGLE_SEARCH_CX }}
+          GOOGLE_SHEETS_CREDENTIALS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS }}
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
         run: python fringe_tracker.py
 
       - name: Commit updated data

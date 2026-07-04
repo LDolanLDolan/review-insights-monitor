@@ -30,8 +30,15 @@ def show_dashboard():
     # ── Health check panel ──────────────────────────────────────────────
     col1, col2, col3 = st.columns(3)
     col1.metric("Last checked", status.get("last_run", "never")[:16].replace("T", " ") or "never")
-    col2.metric("Shows tracked", status.get("shows_loaded", 0))
+    col2.metric("Shows checked today", status.get("shows_in_todays_batch", 0))
     col3.metric("Reviews found so far", status.get("total_reviews_tracked", 0))
+
+    total = status.get("total_shows", 0)
+    if total:
+        st.caption(
+            f"Rotates through all {total} shows in batches — full list re-checked every few days, "
+            f"not all 217 every single run, to stay within the free search quota."
+        )
 
     if status.get("status") not in ("ok", None):
         st.warning(f"Status: {status.get('status')}")

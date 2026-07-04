@@ -32,6 +32,14 @@ from pathlib import Path
 
 import requests
 
+# Google Sheets is optional — only used if the two secrets below are set.
+try:
+    import gspread
+    from google.oauth2.service_account import Credentials
+    SHEETS_AVAILABLE = True
+except ImportError:
+    SHEETS_AVAILABLE = False
+
 # ── Paths (all relative to the repo root) ──────────────────────────────────
 BASE = Path(__file__).parent
 DATA_DIR = BASE / "data"
@@ -46,6 +54,11 @@ log = logging.getLogger(__name__)
 GOOGLE_API_KEY = os.environ.get("GOOGLE_SEARCH_API_KEY", "")
 GOOGLE_CX = os.environ.get("GOOGLE_SEARCH_CX", "")
 SEARCH_API_URL = "https://www.googleapis.com/customsearch/v1"
+
+# Optional — only needed if you want the Google Sheets export for staff access
+GOOGLE_SHEETS_CREDENTIALS = os.environ.get("GOOGLE_SHEETS_CREDENTIALS", "")
+GOOGLE_SHEET_ID = os.environ.get("GOOGLE_SHEET_ID", "")
+SHEET_HEADERS = ["Date Found", "Show Title", "Venue", "Company", "Review Source", "Snippet", "URL", "Stars"]
 
 # ── Review sites to search across ───────────────────────────────────────────
 REVIEW_SITES = [
@@ -66,6 +79,30 @@ REVIEW_SITES = [
     "glasgowtheatreblog.co.uk", "louderthanwar.com",
 ]
 SITE_RESTRICT = " OR ".join(f"site:{s}" for s in REVIEW_SITES)
+
+# ── Batch rotation ───────────────────────────────────────────────────────────
+# Google's free Custom Search tier caps out at 100 queries/day. With 217 shows,
+# checking everything in one run would blow past that every time. Instead we
+# split the show list into batches and rotate through them by date, so the
+# full list gets covered every few days rather than failing outright every run.
+BATCH_SIZE = 70  # comfortably under the 100/day free cap, with margin
+
+
+def select_todays_batch(shows: list[dict]) -> list[dict]:
+    if not shows:
+        return shows
+    num_batches = max(1, -(-len(shows) // BATCH_SIZE))  # ceil division
+    day_index = datetime.now(timezone.utc).timetuple().tm_yday
+    batch_num = day_index % num_batches
+    # interleaved slice so each day's batch spans the whole alphabet,
+    # not just one contiguous chunk of it
+    batch = shows[batch_num::num_batches]
+    log.info(
+        f"Batch {batch_num + 1} of {num_batches} today — "
+        f"checking {len(batch)} of {len(shows)} shows "
+        f"(full list covered roughly every {num_batches} day(s))"
+    )
+    return batch
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -154,11 +191,62 @@ def search_for_reviews(show: dict) -> list[dict]:
     return results
 
 
+# ── Google Sheets export (optional, for staff access) ───────────────────────
+def get_sheet():
+    """Returns a gspread worksheet object, or None if Sheets isn't configured."""
+    if not SHEETS_AVAILABLE:
+        log.info("gspread not installed — skipping Sheets export.")
+        return None
+    if not GOOGLE_SHEETS_CREDENTIALS or not GOOGLE_SHEET_ID:
+        log.info("Google Sheets secrets not set — skipping Sheets export.")
+        return None
+
+    try:
+        creds_dict = json.loads(GOOGLE_SHEETS_CREDENTIALS)
+        creds = Credentials.from_service_account_info(
+            creds_dict,
+            scopes=["https://www.googleapis.com/auth/spreadsheets",
+                    "https://www.googleapis.com/auth/drive"],
+        )
+        client = gspread.authorize(creds)
+        sheet = client.open_by_key(GOOGLE_SHEET_ID).sheet1
+        return sheet
+    except Exception as e:
+        log.error(f"Could not connect to Google Sheet: {e}")
+        return None
+
+
+def ensure_headers(sheet):
+    first_row = sheet.row_values(1)
+    if first_row != SHEET_HEADERS:
+        sheet.clear()
+        sheet.append_row(SHEET_HEADERS)
+
+
+def append_to_sheet(sheet, review: dict):
+    sheet.append_row([
+        review["date_found"],
+        review["show_title"],
+        review.get("venue", ""),
+        review.get("company", ""),
+        review["review_source"],
+        review["snippet"],
+        review["url"],
+        review["stars"],
+    ])
+
+
 # ── Main run ─────────────────────────────────────────────────────────────────
 def main():
-    shows = load_shows()
+    all_shows = load_shows()
+    shows = select_todays_batch(all_shows)
     reviews = load_json(REVIEWS_PATH, [])
     seen_urls = {url_hash(r["url"]) for r in reviews}
+
+    sheet = get_sheet()
+    if sheet:
+        ensure_headers(sheet)
+        log.info("Connected to Google Sheet — will mirror new reviews there too.")
 
     new_count = 0
     searched_count = 0
@@ -176,7 +264,7 @@ def main():
             uid = url_hash(result["url"])
             if uid in seen_urls:
                 continue
-            reviews.append({
+            review = {
                 "date_found": datetime.now(timezone.utc).isoformat(),
                 "show_title": title,
                 "company": show.get("company", ""),
@@ -185,10 +273,17 @@ def main():
                 "snippet": result["snippet"],
                 "url": result["url"],
                 "stars": result["stars"],
-            })
+            }
+            reviews.append(review)
             seen_urls.add(uid)
             new_count += 1
             log.info(f"  New review found: {result['url']}")
+
+            if sheet:
+                try:
+                    append_to_sheet(sheet, review)
+                except Exception as e:
+                    log.error(f"Failed to write to Google Sheet: {e}")
 
         time.sleep(1.2)  # be polite to the search API
 
@@ -196,7 +291,8 @@ def main():
 
     status = {
         "last_run": datetime.now(timezone.utc).isoformat(),
-        "shows_loaded": len(shows),
+        "total_shows": len(all_shows),
+        "shows_in_todays_batch": len(shows),
         "shows_searched": searched_count,
         "new_reviews_this_run": new_count,
         "total_reviews_tracked": len(reviews),
@@ -205,8 +301,8 @@ def main():
     save_json(STATUS_PATH, status)
 
     log.info(
-        f"Done. Checked {searched_count} shows, found {new_count} new review(s). "
-        f"Total tracked: {len(reviews)}."
+        f"Done. Checked {searched_count} of {len(all_shows)} total shows, "
+        f"found {new_count} new review(s). Total tracked: {len(reviews)}."
     )
 
 
