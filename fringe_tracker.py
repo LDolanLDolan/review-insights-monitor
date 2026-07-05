@@ -2,14 +2,14 @@
 SundayFringe Review Tracker — GitHub Actions Edition
 -----------------------------------------------------
 Runs entirely on GitHub's free servers via GitHub Actions. No PythonAnywhere
-account, no Google Sheets, no monthly fee, and nothing to install or run
-on your own computer.
+account, no Google billing account, no card required, nothing to install or
+run on your own computer.
 
 What it does each time it runs:
   1. Loads the list of C venues shows from data/shows.json
-  2. Searches ~35 Fringe review sites (Broadway Baby, FringeReview,
-     ThreeWeeks and more) for mentions of each show title, using Google's
-     free Custom Search API
+  2. Searches DuckDuckGo for each show title, then keeps only results from
+     ~35 trusted Fringe review sites (Broadway Baby, FringeReview,
+     ThreeWeeks and more) — no API key or account needed at all
   3. Adds any newly-found reviews to data/reviews.json
   4. Updates data/status.json with a timestamp and summary — this is your
      "is it working" check. Open that file in GitHub any time to see the
@@ -17,7 +17,7 @@ What it does each time it runs:
      were found.
 
 GitHub Actions runs this automatically on the schedule set in
-.github/workflows/track-reviews.yml (default: twice a day). You never need
+.github/workflows/track-reviews.yml (default: once a day). You never need
 to run this file yourself, but you can with:  python fringe_tracker.py
 """
 
@@ -29,8 +29,10 @@ import hashlib
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlparse, parse_qs, unquote
 
 import requests
+from bs4 import BeautifulSoup
 
 # Google Sheets is optional — only used if the two secrets below are set.
 try:
@@ -51,10 +53,6 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)s  %(me
 log = logging.getLogger(__name__)
 
 # ── Config from GitHub Secrets (set once in repo Settings > Secrets) ───────
-GOOGLE_API_KEY = os.environ.get("GOOGLE_SEARCH_API_KEY", "")
-GOOGLE_CX = os.environ.get("GOOGLE_SEARCH_CX", "")
-SEARCH_API_URL = "https://www.googleapis.com/customsearch/v1"
-
 # Optional — only needed if you want the Google Sheets export for staff access
 GOOGLE_SHEETS_CREDENTIALS = os.environ.get("GOOGLE_SHEETS_CREDENTIALS", "")
 GOOGLE_SHEET_ID = os.environ.get("GOOGLE_SHEET_ID", "")
@@ -78,14 +76,27 @@ REVIEW_SITES = [
     "lisainthetheatre.com", "bingefringereviews.com", "fromnorth.co.uk",
     "glasgowtheatreblog.co.uk", "louderthanwar.com",
 ]
-SITE_RESTRICT = " OR ".join(f"site:{s}" for s in REVIEW_SITES)
+REVIEW_SITES_SET = set(REVIEW_SITES)
+
+# DuckDuckGo doesn't handle a single giant "site:a OR site:b OR ... OR site:z"
+# query reliably (Google's Custom Search API could, this can't). Splitting
+# the 35 sites into smaller groups and running one restricted query per group
+# gets much closer to Google's precision — each query only asks DuckDuckGo to
+# look inside a handful of domains, rather than hoping a review ranks in an
+# unrestricted general search.
+SITE_GROUP_SIZE = 9
+
+
+def _chunk(items: list, size: int) -> list[list]:
+    return [items[i:i + size] for i in range(0, len(items), size)]
+
+
+SITE_GROUPS = _chunk(REVIEW_SITES, SITE_GROUP_SIZE)
 
 # ── Batch rotation ───────────────────────────────────────────────────────────
-# Google's free Custom Search tier caps out at 100 queries/day. With 217 shows,
-# checking everything in one run would blow past that every time. Instead we
-# split the show list into batches and rotate through them by date, so the
-# full list gets covered every few days rather than failing outright every run.
-BATCH_SIZE = 70  # comfortably under the 100/day free cap, with margin
+# Each show now takes ~4 requests (one per site group) instead of 1, so batches
+# need to be smaller to keep run time reasonable and avoid hammering DuckDuckGo.
+BATCH_SIZE = 45
 
 
 def select_todays_batch(shows: list[dict]) -> list[dict]:
@@ -156,39 +167,115 @@ def load_shows() -> list[dict]:
 
 
 # ── Searching ────────────────────────────────────────────────────────────────
-def search_for_reviews(show: dict) -> list[dict]:
-    """Searches Google Custom Search, restricted to REVIEW_SITES, for a show title."""
-    if not GOOGLE_API_KEY or not GOOGLE_CX:
-        log.error("Missing GOOGLE_SEARCH_API_KEY or GOOGLE_SEARCH_CX secret.")
-        return []
+DDG_URL = "https://html.duckduckgo.com/html/"
+DDG_HEADERS = {
+    # A normal browser user-agent — DuckDuckGo's HTML endpoint is more likely
+    # to respond normally to requests that look like an ordinary browser visit.
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    )
+}
 
-    title = show["title"]
-    query = f'"{title}" ({SITE_RESTRICT})'
-    params = {
-        "key": GOOGLE_API_KEY,
-        "cx": GOOGLE_CX,
-        "q": query,
-        "num": 10,
-    }
 
+def _domain_from_url(url: str) -> str:
     try:
-        resp = requests.get(SEARCH_API_URL, params=params, timeout=20)
-        resp.raise_for_status()
-        data = resp.json()
-    except requests.RequestException as e:
-        log.error(f"Search failed for '{title}': {e}")
-        return []
+        netloc = urlparse(url).netloc.lower()
+        return netloc[4:] if netloc.startswith("www.") else netloc
+    except Exception:
+        return ""
 
-    results = []
-    for item in data.get("items", []):
-        snippet = item.get("snippet", "")
-        results.append({
-            "url": item.get("link", ""),
-            "source": item.get("displayLink", ""),
-            "snippet": snippet,
-            "stars": extract_stars(snippet),
-        })
-    return results
+
+def _matches_review_site(domain: str) -> str:
+    """Returns the matching review site if this domain is one we trust, else ''."""
+    for site in REVIEW_SITES_SET:
+        if domain == site or domain.endswith("." + site):
+            return site
+    return ""
+
+
+def _run_ddg_query(query: str) -> tuple[list[dict], bool]:
+    """Runs one DuckDuckGo query and returns (raw results, succeeded)."""
+    try:
+        resp = requests.post(
+            DDG_URL,
+            data={"q": query},
+            headers=DDG_HEADERS,
+            timeout=20,
+        )
+        resp.raise_for_status()
+    except requests.RequestException as e:
+        log.error(f"Query failed: '{query[:80]}...': {e}")
+        return [], False
+
+    soup = BeautifulSoup(resp.text, "lxml")
+    found = []
+
+    for result_div in soup.select(".result"):
+        link_tag = result_div.select_one(".result__a")
+        snippet_tag = result_div.select_one(".result__snippet")
+        if not link_tag or not link_tag.get("href"):
+            continue
+
+        raw_href = link_tag["href"]
+        # DuckDuckGo's HTML results wrap the real URL inside a redirect link
+        # like //duckduckgo.com/l/?uddg=<encoded real url>&... — unwrap it.
+        real_url = raw_href
+        if "uddg=" in raw_href:
+            parsed_qs = parse_qs(urlparse(raw_href).query)
+            if "uddg" in parsed_qs:
+                real_url = unquote(parsed_qs["uddg"][0])
+
+        snippet = snippet_tag.get_text(strip=True) if snippet_tag else ""
+        found.append({"url": real_url, "snippet": snippet})
+
+    return found, True
+
+
+def search_for_reviews(show: dict) -> tuple[list[dict], bool]:
+    """
+    Runs several DuckDuckGo searches per show — one per group of ~9 review
+    sites — each restricted with 'site:a OR site:b OR ...'. This is closer to
+    the domain-restricted precision Google's Custom Search API gave us,
+    without needing an API key, billing account, or card.
+
+    Returns (results, succeeded). succeeded is False only if every one of
+    the sub-queries failed outright (network error, blocked, etc.) — partial
+    failures still return whatever results the working sub-queries found.
+    """
+    title = show["title"]
+    all_results = []
+    seen_result_urls = set()
+    any_succeeded = False
+
+    for group in SITE_GROUPS:
+        site_clause = " OR ".join(f"site:{s}" for s in group)
+        query = f'"{title}" {site_clause}'
+
+        found, succeeded = _run_ddg_query(query)
+        if succeeded:
+            any_succeeded = True
+
+        for item in found:
+            if item["url"] in seen_result_urls:
+                continue
+            seen_result_urls.add(item["url"])
+
+            domain = _domain_from_url(item["url"])
+            matched_site = _matches_review_site(domain)
+            if not matched_site:
+                continue  # DuckDuckGo ignored the site: restriction — discard
+
+            all_results.append({
+                "url": item["url"],
+                "source": matched_site,
+                "snippet": item["snippet"],
+                "stars": extract_stars(item["snippet"]),
+            })
+
+        time.sleep(1.2)  # be polite between sub-queries too, not just between shows
+
+    return all_results, any_succeeded
 
 
 # ── Google Sheets export (optional, for staff access) ───────────────────────
@@ -250,6 +337,7 @@ def main():
 
     new_count = 0
     searched_count = 0
+    failed_count = 0
 
     for show in shows:
         title = show.get("title", "").strip()
@@ -257,8 +345,10 @@ def main():
             continue
 
         log.info(f"Searching: {title}")
-        results = search_for_reviews(show)
+        results, succeeded = search_for_reviews(show)
         searched_count += 1
+        if not succeeded:
+            failed_count += 1
 
         for result in results:
             uid = url_hash(result["url"])
@@ -285,24 +375,35 @@ def main():
                 except Exception as e:
                     log.error(f"Failed to write to Google Sheet: {e}")
 
-        time.sleep(1.2)  # be polite to the search API
+        time.sleep(0.8)  # a little extra breathing room between shows
 
     save_json(REVIEWS_PATH, reviews)
+
+    if searched_count == 0:
+        status_text = "no shows loaded — check data/shows.json"
+    elif failed_count == searched_count:
+        status_text = "all searches failed — check the Actions log for the error"
+    elif failed_count > 0:
+        status_text = f"ok, but {failed_count} of {searched_count} searches failed"
+    else:
+        status_text = "ok"
 
     status = {
         "last_run": datetime.now(timezone.utc).isoformat(),
         "total_shows": len(all_shows),
         "shows_in_todays_batch": len(shows),
         "shows_searched": searched_count,
+        "searches_failed": failed_count,
         "new_reviews_this_run": new_count,
         "total_reviews_tracked": len(reviews),
-        "status": "ok" if searched_count > 0 else "no shows loaded — check data/shows.json",
+        "status": status_text,
     }
     save_json(STATUS_PATH, status)
 
     log.info(
-        f"Done. Checked {searched_count} of {len(all_shows)} total shows, "
-        f"found {new_count} new review(s). Total tracked: {len(reviews)}."
+        f"Done. Checked {searched_count} of {len(all_shows)} total shows "
+        f"({failed_count} failed), found {new_count} new review(s). "
+        f"Total tracked: {len(reviews)}."
     )
 
 
