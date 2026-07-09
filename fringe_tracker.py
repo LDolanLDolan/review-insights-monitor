@@ -74,16 +74,16 @@ REVIEW_SITES = [
     # Major outlets
     "scotsman.com", "theguardian.com", "timeout.com", "thestage.co.uk",
     "whatsonstage.com", "exeuntmagazine.com", "fest-mag.com", "theskinny.co.uk",
-    "chortle.co.uk", "broadwaybaby.com", "britishcomedyguide.co.uk",
+    "chortle.co.uk", "broadwaybaby.com", "comedy.co.uk",
     "totaltheatre.org.uk", "theupcoming.co.uk",
     # Mid-tier reliable
-    "fringereview.co.uk", "theweerev.com", "edfringereview.com",
+    "fringereview.co.uk", "theweereview.com", "edfringereview.com",
     "theatreweekly.com", "theatreandtonic.com", "one4review.co.uk",
     "voicemag.uk", "theatrescotland.com", "threeweeeks.co.uk",
     "westendbestfriend.com",
     # Smaller blogs — most likely to cover emerging/overlooked shows
-    "loureviews.co.uk", "fringebiscuit.com", "lostintheatreland.co.uk",
-    "katmasterson.com", "corrblimey.co.uk", "clownster.co.uk",
+    "loureviews.blog", "fringebiscuit.com", "lostintheatreland.co.uk",
+    "katmasterson.com", "corrblimey.uk", "clownster.co.uk",
     "lisainthetheatre.com", "bingefringereviews.com", "fromnorth.co.uk",
     "glasgowtheatreblog.co.uk", "louderthanwar.com",
 ]
