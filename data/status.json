@@ -1,9 +1,9 @@
 {
-  "last_run": "2026-07-14T10:29:15.398102+00:00",
+  "last_run": "2026-07-15T10:32:50.022458+00:00",
   "total_shows": 217,
-  "shows_in_todays_batch": 73,
-  "shows_searched": 73,
-  "searches_failed": 73,
+  "shows_in_todays_batch": 72,
+  "shows_searched": 72,
+  "searches_failed": 72,
   "new_reviews_this_run": 0,
   "total_reviews_tracked": 0,
   "status": "all searches failed — check the Actions log for the error"
